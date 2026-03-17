@@ -1,0 +1,47 @@
+app:
+  environment: dev
+
+database:
+  url: sqlite:///./data/app.db
+
+auth:
+  header: Authorization
+  bearer_prefix: Bearer
+
+upstream:
+  base_url: https://example.com
+  timeout_seconds: 60
+  default_bearer_token: ""
+  api_key_mapping:
+    demo-key: ""
+  model_mapping:
+    next-light: upstream-model-id
+
+# 也支持通过环境变量覆盖（优先级高于本文件）：
+# - CONFIG_PATH
+# - DATABASE_URL
+# - UPSTREAM_BASE_URL
+# - UPSTREAM_TIMEOUT_SECONDS
+# - UPSTREAM_DEFAULT_BEARER_TOKEN
+# - UPSTREAM_API_KEY_MAPPING  (JSON或"k=v,k2=v2")
+# - UPSTREAM_MODEL_MAPPING    (JSON或"k=v,k2=v2")
+# - BILLING_RMB_PER_MILLION_WITH_VIDEO_INPUT
+# - BILLING_RMB_PER_MILLION_WITHOUT_VIDEO_INPUT
+
+pricing:
+  create:
+    tokens_per_second: 20000
+    default_duration_seconds: 5
+    resolution_multiplier:
+      720p: 1.0
+      1080p: 1.5
+      2k: 2.0
+      4k: 3.0
+  query:
+    fixed_tokens: 1
+  cancel:
+    success_tokens: 1
+    failed_tokens: 0
+  money:
+    with_video_input_rmb_per_million: 28
+    without_video_input_rmb_per_million: 46

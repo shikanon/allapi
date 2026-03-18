@@ -36,6 +36,12 @@ export function VideoDebugPanel() {
   const [createError, setCreateError] = useState('')
   const [createdTaskId, setCreatedTaskId] = useState('')
 
+  const [mode, setMode] = useState<'create' | 'generate'>('create')
+  const [generateTimeout, setGenerateTimeout] = useState(300)
+  const [generatePollInterval, setGeneratePollInterval] = useState(2)
+  const [wsStatus, setWsStatus] = useState('')
+  const [wsMessage, setWsMessage] = useState('')
+
   const [taskId, setTaskId] = useState('')
   const [queryLoading, setQueryLoading] = useState(false)
   const [queryError, setQueryError] = useState('')
@@ -50,12 +56,100 @@ export function VideoDebugPanel() {
 
   const activeTaskId = useMemo(() => (taskId || createdTaskId).trim(), [taskId, createdTaskId])
 
+  async function onGenerateWS() {
+    setCreateError('')
+    setWsStatus('connecting')
+    setWsMessage('正在连接 WebSocket...')
+    setQueryResult(null)
+    setCreateLoading(true)
+
+    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/v1/video/tasks/ws`
+    const ws = new WebSocket(wsUrl)
+
+    ws.onopen = () => {
+      setWsStatus('open')
+      setWsMessage('连接成功，正在发送参数...')
+      try {
+        const payload = JSON.parse(createJson) as Record<string, unknown>
+        ws.send(
+          JSON.stringify({
+            token,
+            payload: {
+              ...payload,
+              timeout_seconds: generateTimeout,
+              poll_interval_seconds: generatePollInterval,
+            },
+          })
+        )
+      } catch (e) {
+        setCreateError(`JSON 解析错误: ${e instanceof Error ? e.message : String(e)}`)
+        ws.close()
+      }
+    }
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data) as {
+          type: string
+          status?: string
+          message?: string
+          task_id?: string
+          data?: unknown
+          detail?: unknown
+        }
+
+        if (data.type === 'status') {
+          setWsStatus(data.status || 'running')
+          setWsMessage(data.message || '任务进行中...')
+          if (data.task_id) {
+            setCreatedTaskId(data.task_id)
+            setTaskId(data.task_id)
+            addTask(token, data.task_id)
+          }
+        } else if (data.type === 'result') {
+          setWsStatus('succeeded')
+          setWsMessage('生成成功！')
+          setQueryResult(data.data)
+          setCreateLoading(false)
+        } else if (data.type === 'error') {
+          setWsStatus('error')
+          setWsMessage(data.message || '发生错误')
+          setCreateError(data.message || '一键生成失败')
+          if (data.detail) {
+            setQueryResult(data.detail)
+          }
+          setCreateLoading(false)
+        }
+      } catch (e) {
+        console.error('WS message error:', e)
+      }
+    }
+
+    ws.onerror = () => {
+      setWsStatus('error')
+      setWsMessage('WebSocket 连接失败')
+      setCreateError('WebSocket 建立连接失败')
+      setCreateLoading(false)
+    }
+
+    ws.onclose = () => {
+      setCreateLoading(false)
+    }
+  }
+
   async function onCreate() {
+    if (mode === 'generate') {
+      return onGenerateWS()
+    }
+
     setCreateError('')
     setCreateLoading(true)
+    setQueryResult(null)
     try {
-      const payload = JSON.parse(createJson) as unknown
-      const resp = await apiRequest<CreateResp>('/v1/video/tasks', {
+      const payload = JSON.parse(createJson) as Record<string, unknown>
+      const endpoint = '/v1/video/tasks'
+
+      const resp = await apiRequest<CreateResp>(endpoint, {
         method: 'POST',
         body: payload,
       })
@@ -126,8 +220,78 @@ export function VideoDebugPanel() {
           <CardContent>
             <div className="space-y-6">
               <div>
-                <div className="mb-2 text-sm font-medium text-white">创建任务</div>
-                <div className="text-xs text-white/60">填写 JSON 请求体，点击发送。</div>
+                <div className="mb-4 flex gap-2 border-b border-white/10 pb-2">
+                  <button
+                    className={`px-3 py-1.5 text-xs font-medium transition-colors ${
+                      mode === 'create'
+                        ? 'border-b-2 border-blue-500 text-white'
+                        : 'text-white/60 hover:text-white'
+                    }`}
+                    onClick={() => setMode('create')}
+                  >
+                    创建任务 (Create)
+                  </button>
+                  <button
+                    className={`px-3 py-1.5 text-xs font-medium transition-colors ${
+                      mode === 'generate'
+                        ? 'border-b-2 border-blue-500 text-white'
+                        : 'text-white/60 hover:text-white'
+                    }`}
+                    onClick={() => setMode('generate')}
+                  >
+                    一键生成 (Generate)
+                  </button>
+                </div>
+
+                <div className="mb-2 text-sm font-medium text-white">
+                  {mode === 'create' ? '创建任务' : '一键生成并等待结果'}
+                </div>
+                <div className="text-xs text-white/60">
+                  {mode === 'create'
+                    ? '填写 JSON 请求体，点击发送。创建成功后需手动查询结果。'
+                    : '填写 JSON 请求体，点击发送。服务端将轮询直到任务成功产出或超时。'}
+                </div>
+
+                {mode === 'generate' && (
+                  <div className="mt-4 space-y-3">
+                    <div className="grid grid-cols-2 gap-4 rounded-lg border border-white/10 bg-white/5 p-3">
+                      <div className="space-y-1.5">
+                        <label className="text-xs text-white/60">轮询间隔 (秒)</label>
+                        <Input
+                          type="number"
+                          min={0.2}
+                          max={10}
+                          step={0.1}
+                          value={generatePollInterval}
+                          onChange={(e) => setGeneratePollInterval(Number(e.target.value))}
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-xs text-white/60">超时限制 (秒)</label>
+                        <Input
+                          type="number"
+                          min={1}
+                          max={1800}
+                          value={generateTimeout}
+                          onChange={(e) => setGenerateTimeout(Number(e.target.value))}
+                        />
+                      </div>
+                    </div>
+
+                    {createLoading && wsStatus && (
+                      <div className="rounded-lg border border-blue-500/30 bg-blue-500/10 p-3">
+                        <div className="flex items-center gap-2">
+                          <div className="h-2 w-2 animate-pulse rounded-full bg-blue-500" />
+                          <span className="text-xs font-medium text-blue-400">
+                            {wsStatus.toUpperCase()}
+                          </span>
+                        </div>
+                        <div className="mt-1 text-xs text-white/80">{wsMessage}</div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 <div className="mt-3">
                   <Textarea value={createJson} onChange={(e) => setCreateJson(e.target.value)} />
                 </div>
@@ -136,7 +300,7 @@ export function VideoDebugPanel() {
                 ) : null}
                 <div className="mt-3 flex items-center gap-3">
                   <Button loading={createLoading} onClick={onCreate}>
-                    发送创建请求
+                    {mode === 'create' ? '发送创建请求' : '一键生成并轮询结果'}
                   </Button>
                   {createdTaskId ? (
                     <div className="text-xs text-white/70">task_id：{createdTaskId}</div>

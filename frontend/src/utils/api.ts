@@ -46,6 +46,13 @@ export async function apiRequest<T>(
     body = JSON.stringify(options?.body ?? {})
   }
 
+  // Debug log request
+  console.groupCollapsed(`[API Request] ${method} ${path}`)
+  console.debug('Request ID:', id)
+  console.debug('Headers:', headers)
+  if (hasBody) console.debug('Body:', options?.body)
+  console.groupEnd()
+
   let status: number | null = null
   let responseText = ''
   let ok = false
@@ -56,6 +63,20 @@ export async function apiRequest<T>(
     status = resp.status
     ok = resp.ok
     responseText = await resp.text()
+
+    // Debug log response
+    const end = performance.now()
+    const duration = Math.round(end - startedAt)
+    console.groupCollapsed(`[API Response] ${method} ${path} - ${status} (${duration}ms)`)
+    console.debug('Request ID:', id)
+    console.debug('Status:', status)
+    console.debug('Headers:', Object.fromEntries(resp.headers.entries()))
+    try {
+      console.debug('Body:', responseText ? JSON.parse(responseText) : null)
+    } catch {
+      console.debug('Body (Text):', responseText)
+    }
+    console.groupEnd()
 
     if (!resp.ok) {
       const bodyPreview = responseText ? `: ${responseText.slice(0, 500)}` : ''

@@ -1,5 +1,6 @@
 app:
   environment: dev
+  log_level: INFO
 
 database:
   url: sqlite:///./data/app.db
@@ -29,19 +30,6 @@ upstream:
 # - BILLING_RMB_PER_MILLION_WITHOUT_VIDEO_INPUT
 
 pricing:
-  create:
-    tokens_per_second: 20000
-    default_duration_seconds: 5
-    resolution_multiplier:
-      720p: 1.0
-      1080p: 1.5
-      2k: 2.0
-      4k: 3.0
-  query:
-    fixed_tokens: 1
-  cancel:
-    success_tokens: 1
-    failed_tokens: 0
   money:
     with_video_input_rmb_per_million: 28
     without_video_input_rmb_per_million: 46

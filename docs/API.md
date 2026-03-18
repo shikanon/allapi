@@ -14,7 +14,7 @@
 方式A（推荐）：创建用户脚本
 
 ```bash
-python3 scripts/create_user.py --balance 100000
+python3 scripts/create_user.py --balance_rmb 1000
 ```
 
 输出内容即为用户Token，调用接口时作为 `Authorization: Bearer <用户Token>`。
@@ -22,7 +22,7 @@ python3 scripts/create_user.py --balance 100000
 也可手动指定：
 
 ```bash
-python3 scripts/create_user.py --token user_001 --balance 100000
+python3 scripts/create_user.py --token user_001 --balance_rmb 1000
 ```
 
 方式B：Demo脚本（会额外写入一条默认模型映射）
@@ -33,10 +33,8 @@ python3 scripts/seed_demo.py
 
 ## 2. 余额与计费
 
-- 余额单位：`tokens`（可理解为点数/额度）
-- 创建任务：按“时长 * tokens_per_second * 分辨率倍率”预估扣费（配置见 `config.yaml`）
-- 查询任务：固定扣费（默认 1 token）
-- 取消任务：根据取消结果扣费（默认取消成功 1 token，失败 0 token）
+- 余额单位：人民币（RMB）
+- 扣费基准：上游返回 `usage.total_tokens`（系统按配置折算为人民币并扣减余额，同时记录 tokens 与人民币）
 
 余额不足返回 `402`。
 
@@ -50,9 +48,79 @@ python3 scripts/seed_demo.py
   - 返回体包含 `content.video_url`
   - 返回体包含 `usage.total_tokens` 且 > 0
 
-满足条件时按该 `task_id` **只扣费一次**（重复查询不会重复扣费）。若扣费时余额不足，会返回 `402`。
+满足条件时按该 `task_id` **只扣费一次**（重复查询不会重复扣费）。扣费金额为 `usage.total_tokens` 按配置折算后的人民币；若余额不足会返回 `402`。
 
 取消任务（`POST /v1/video/tasks/{task_id}/cancel`）：不扣费（仅转发与记录）。
+
+### 2.2 一键生成并实时推送（WebSocket）
+
+如果希望通过 WebSocket 实现一键生成并实时接收状态更新（排队、生成中、成功/失败），可使用：
+
+`WS /v1/video/tasks/ws`
+
+#### 协议流程：
+1. **连接建立**：客户端发起 WebSocket 连接。
+2. **发送参数**：连接成功后，客户端发送第一个 JSON 消息，包含 `token` 和任务参数 `payload`。
+3. **状态推送**：服务端在任务执行过程中推送 `type: "status"` 消息。
+4. **结果返回**：任务成功产出后，服务端推送 `type: "result"` 消息并关闭连接。
+5. **错误处理**：发生错误或超时，服务端推送 `type: "error"` 消息并关闭连接。
+
+#### 消息格式：
+
+**客户端发送 (Initial Message):**
+```json
+{
+  "token": "你的用户Token",
+  "payload": {
+    "model": "next-light",
+    "content": [...],
+    "poll_interval_seconds": 2,
+    "timeout_seconds": 300
+  }
+}
+```
+
+**服务端推送 (Status Update):**
+```json
+{
+  "type": "status",
+  "status": "creating",
+  "message": "正在创建视频生成任务..."
+}
+```
+
+**服务端推送 (Final Result):**
+```json
+{
+  "type": "result",
+  "data": {
+    "id": "cgt-xxx",
+    "status": "succeeded",
+    "content": { "video_url": "..." },
+    "usage": { "total_tokens": 108900 }
+  }
+}
+```
+
+**服务端推送 (Error):**
+```json
+{
+  "type": "error",
+  "message": "等待任务结果超时",
+  "detail": { ... }
+}
+```
+
+### 2.3 一键生成并同步返回（HTTP 轮询）
+
+`POST /v1/video/tasks:generate`
+
+请求体与 `POST /v1/video/tasks` 基本一致，额外支持：
+
+- `poll_interval_seconds`：轮询间隔秒数（默认 2，范围 0.2~10）
+- `timeout_seconds`：最大等待秒数（默认 300，范围 1~1800）
+
+该接口会在任务成功产出后完成扣费，并返回最终任务查询响应；超时返回 `504`。
 
 ### 2.1 RMB 计费（用于核算/测试）
 
@@ -81,7 +149,59 @@ curl -X POST http://localhost:8001/v1/billing/quote \
 
 也支持传入包含 `content` 的请求体，不显式传 `has_video_input` 时会自动判断是否存在 `type=video_url` 或 `role=reference_video`。
 
-## 3. 参数映射
+### 2.4 接口测试示例 (Python)
+
+你可以使用以下脚本快速验证“一键生成”接口及其计费逻辑：
+
+```python
+import requests
+import json
+import time
+
+# 替换为你的 Token 和后端地址
+TOKEN = "your_token"
+BASE_URL = "http://127.0.0.1:8001"
+
+def test_generate():
+    url = f"{BASE_URL}/v1/video/tasks:generate"
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    payload = {
+        "model": "next-light",
+        "content": [{"type": "text", "text": "测试一键生成"}],
+        "timeout_seconds": 60
+    }
+    
+    print("[*] 正在请求一键生成...")
+    resp = requests.post(url, headers=headers, json=payload)
+    if resp.status_code == 200:
+        data = resp.json()
+        task_id = data.get("id")
+        print(f"[+] 任务成功: {task_id}")
+        # 校验返回体中的 Token
+        print(f"    - 上游返回 Token: {data.get('usage', {}).get('total_tokens')}")
+        
+        # 延迟 1s 等待计费落库
+        time.sleep(1)
+        
+        # 校验费用记录
+        usage_resp = requests.get(f"{BASE_URL}/v1/usage", headers=headers)
+        records = usage_resp.json().get("items", [])
+        # 找到对应 task_id 的扣费记录 (video.charge)
+        record = next((r for r in records if r.get("task_id") == task_id and r.get("endpoint") == "video.charge"), None)
+        
+        if record:
+            print(f"[√] 费用记录已生成:")
+            print(f"    - 扣费 Token: {record.get('tokens_charged')}")
+            print(f"    - 扣费金额: {record.get('amount_rmb')} 元")
+            print(f"    - 扣后余额: {record.get('balance_after')} 元")
+        else:
+            print("[!] 未找到扣费记录")
+    else:
+        print(f"[!] 请求失败: {resp.status_code} {resp.text}")
+
+if __name__ == "__main__":
+    test_generate()
+```
 
 ### 3.1 model 映射
 
@@ -109,6 +229,7 @@ curl -X POST http://localhost:8001/v1/billing/quote \
 - `UPSTREAM_DEFAULT_BEARER_TOKEN`
 - `UPSTREAM_API_KEY_MAPPING`
 - `UPSTREAM_MODEL_MAPPING`
+- `LOG_LEVEL` (设置为 `DEBUG` 可查看详细请求日志)
 
 其中 `UPSTREAM_API_KEY_MAPPING` / `UPSTREAM_MODEL_MAPPING` 支持两种格式：
 

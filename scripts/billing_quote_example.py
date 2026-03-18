@@ -9,7 +9,7 @@ import httpx
 
 
 def main():
-    base_url = os.getenv("BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+    base_url = os.getenv("BASE_URL", "http://127.0.0.1:8001").rstrip("/")
     user_token = os.getenv("USER_TOKEN", "").strip()
     if not user_token:
         raise SystemExit("missing USER_TOKEN")
@@ -28,4 +28,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

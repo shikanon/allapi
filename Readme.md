@@ -16,8 +16,27 @@
 ```bash
 pip3 install -r requirements.txt
 cp config.example.yaml config.yaml
-python3 scripts/create_user.py --balance 100000
 python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8001
+```
+
+**提示：开启 DEBUG 日志**
+- 方法 A：修改 `config.yaml` 中 `app.log_level` 为 `DEBUG`。
+- 方法 B：启动时增加环境变量 `LOG_LEVEL=DEBUG`，例如：
+  `LOG_LEVEL=DEBUG python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8001`
+- 方法 C：如需查看 uvicorn 框架本身的 debug 日志，请增加 `--log-level debug` 参数。
+
+### 1.1) 创建用户（获取登录/调用用 Token）
+
+创建一个用户并设置初始余额（单位：人民币），脚本会在 stdout 输出该用户 Token：
+
+```bash
+python3 scripts/create_user.py --balance_rmb 1000
+```
+
+也可以手动指定 Token（便于本地固定使用）。注意：`token` 字段全局唯一，重复创建会报错：
+
+```bash
+python3 scripts/create_user.py --token user_001 --balance_rmb 1000
 ```
 
 ### 2) 启动前端控制台

@@ -27,6 +27,7 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     token: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
     balance_tokens: Mapped[float] = mapped_column(Numeric(20, 6), nullable=False, default=0)
+    balance_rmb: Mapped[float] = mapped_column(Numeric(20, 6), nullable=False, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
@@ -63,6 +64,7 @@ class ConsumptionRecord(Base):
     request_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
 
     tokens_charged: Mapped[float] = mapped_column(Numeric(20, 6), nullable=False, default=0)
+    amount_rmb: Mapped[float] = mapped_column(Numeric(20, 6), nullable=False, default=0)
     balance_before: Mapped[float] = mapped_column(Numeric(20, 6), nullable=False)
     balance_after: Mapped[float] = mapped_column(Numeric(20, 6), nullable=False)
 
@@ -90,6 +92,7 @@ class VideoTask(Base):
 
     charged: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     charged_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    charged_amount_rmb: Mapped[Optional[float]] = mapped_column(Numeric(20, 6), nullable=True)
     charged_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)

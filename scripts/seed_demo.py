@@ -18,7 +18,7 @@ def main():
     db: Session = SessionLocal()
     try:
         token = secrets.token_hex(16)
-        user = User(token=token, balance_tokens=1_000_000)
+        user = User(token=token, balance_rmb=1000)
         db.add(user)
 
         if not db.query(ModelMapping).filter(ModelMapping.public_name == "next-light").one_or_none():

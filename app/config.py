@@ -28,37 +28,18 @@ class UpstreamConfig(BaseModel):
     model_mapping: Dict[str, str] = Field(default_factory=dict)
 
 
-class PricingCreateConfig(BaseModel):
-    tokens_per_second: int = 20000
-    default_duration_seconds: int = 5
-    resolution_multiplier: Dict[str, float] = Field(
-        default_factory=lambda: {"720p": 1.0, "1080p": 1.5, "2k": 2.0, "4k": 3.0}
-    )
-
-
-class PricingQueryConfig(BaseModel):
-    fixed_tokens: int = 1
-
-
-class PricingCancelConfig(BaseModel):
-    success_tokens: int = 1
-    failed_tokens: int = 0
-
-
 class PricingMoneyConfig(BaseModel):
     with_video_input_rmb_per_million: float = 28.0
     without_video_input_rmb_per_million: float = 46.0
 
 
 class PricingConfig(BaseModel):
-    create: PricingCreateConfig = Field(default_factory=PricingCreateConfig)
-    query: PricingQueryConfig = Field(default_factory=PricingQueryConfig)
-    cancel: PricingCancelConfig = Field(default_factory=PricingCancelConfig)
     money: PricingMoneyConfig = Field(default_factory=PricingMoneyConfig)
 
 
 class AppSectionConfig(BaseModel):
     environment: str = "dev"
+    log_level: str = "INFO"
 
 
 class AppConfig(BaseModel):

@@ -15,6 +15,7 @@ export default defineConfig({
       '/v1': {
         target: apiTarget,
         changeOrigin: true,
+        ws: true,
       },
       '/healthz': {
         target: apiTarget,

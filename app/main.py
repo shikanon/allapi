@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import asyncio
 import uuid
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from starlette.datastructures import Headers
@@ -18,7 +19,6 @@ from app.billing import (
     charge_and_record,
     detect_video_input,
     ensure_balance,
-    estimate_create_tokens,
     quote_rmb,
 )
 from datetime import datetime
@@ -32,7 +32,10 @@ from app.proxy import forward_json
 
 def _setup_logging():
     Path("logs").mkdir(parents=True, exist_ok=True)
-    level_name = (os.getenv("LOG_LEVEL") or "INFO").upper().strip()
+    cfg = get_config()
+    
+    # 优先使用环境变量，其次使用配置文件
+    level_name = (os.getenv("LOG_LEVEL") or cfg.app.log_level or "INFO").upper().strip()
     level = getattr(logging, level_name, logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     file_handler = logging.FileHandler("logs/app.log")
@@ -96,6 +99,17 @@ async def request_id_middleware(request: Request, call_next):
 
     response = await call_next(req)
     response.headers["X-Request-Id"] = request_id
+
+    if logger.isEnabledFor(logging.DEBUG):
+        # We can't easily read the response body in middleware without consuming it,
+        # but we can log status and headers.
+        logger.debug(
+            "outgoing %s %s status=%s headers=%s",
+            req.method,
+            req.url.path,
+            response.status_code,
+            _redact_headers(response.headers),
+        )
     return response
 
 
@@ -275,6 +289,7 @@ async def create_video_task(
             user=user,
             endpoint="video.create",
             tokens=Decimal("0"),
+            amount_rmb=Decimal("0"),
             status_text="upstream_error",
             request_id=request_id,
             upstream_status_code=None,
@@ -293,6 +308,7 @@ async def create_video_task(
             user=user,
             endpoint="video.create",
             tokens=Decimal("0"),
+            amount_rmb=Decimal("0"),
             status_text="success",
             request_id=request_id,
             upstream_status_code=resp.status_code,
@@ -321,6 +337,7 @@ async def create_video_task(
             user=user,
             endpoint="video.create",
             tokens=Decimal("0"),
+            amount_rmb=Decimal("0"),
             status_text="failed",
             request_id=request_id,
             upstream_status_code=resp.status_code,
@@ -329,6 +346,504 @@ async def create_video_task(
         )
 
     return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+
+
+@app.websocket("/v1/video/tasks/ws")
+async def generate_video_task_ws(
+    websocket: WebSocket,
+    db: Session = Depends(get_db),
+):
+    await websocket.accept()
+    request_id = uuid.uuid4().hex
+    
+    try:
+        # 1. 接收认证和参数
+        # 客户端应首先发送一个 JSON，包含 token 和任务参数
+        initial_data = await websocket.receive_json()
+        if not isinstance(initial_data, dict):
+            await websocket.send_json({"type": "error", "message": "Invalid initial data format"})
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
+        token = initial_data.get("token")
+        if not token:
+            # 尝试从 query params 获取
+            token = websocket.query_params.get("token")
+        
+        if not token:
+            await websocket.send_json({"type": "error", "message": "Missing authentication token"})
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
+        user = db.query(User).filter(User.token == token).one_or_none()
+        if not user or not user.is_active:
+            await websocket.send_json({"type": "error", "message": "Invalid authentication token"})
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
+        payload = initial_data.get("payload")
+        if not isinstance(payload, dict):
+            await websocket.send_json({"type": "error", "message": "Missing or invalid payload"})
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
+        # 2. 准备任务参数
+        poll_interval_seconds = payload.pop("poll_interval_seconds", 2)
+        timeout_seconds = payload.pop("timeout_seconds", 300)
+        try:
+            poll_interval_seconds = float(poll_interval_seconds)
+        except Exception:
+            poll_interval_seconds = 2
+        try:
+            timeout_seconds = float(timeout_seconds)
+        except Exception:
+            timeout_seconds = 300
+        poll_interval_seconds = max(0.2, min(poll_interval_seconds, 10.0))
+        timeout_seconds = max(1.0, min(timeout_seconds, 1800.0))
+
+        public_model = payload.get("model")
+        if not isinstance(public_model, str) or not public_model.strip():
+            await websocket.send_json({"type": "error", "message": "Missing model parameter"})
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
+        payload = dict(payload)
+        public_api_key = payload.pop("api_key", None)
+        upstream_model = _resolve_upstream_model(db, public_model.strip())
+        payload["model"] = upstream_model
+        bearer = _resolve_upstream_bearer(db, public_api_key if isinstance(public_api_key, str) else None)
+        upstream_headers = _build_upstream_headers(bearer)
+        has_video_input = detect_video_input(payload)
+
+        # 3. 创建任务
+        await websocket.send_json({"type": "status", "status": "creating", "message": "正在创建视频生成任务..."})
+        
+        try:
+            create_resp = await forward_json(
+                method="POST",
+                path="/api/v3/contents/generations/tasks",
+                headers=upstream_headers,
+                json_body=payload,
+            )
+        except Exception as e:
+            logger.exception("upstream request failed", extra={"request_id": request_id})
+            charge_and_record(
+                db,
+                user=user,
+                endpoint="video.generate_ws",
+                tokens=Decimal("0"),
+                amount_rmb=Decimal("0"),
+                status_text="upstream_error",
+                request_id=request_id,
+                upstream_status_code=None,
+                error_message=str(e),
+            )
+            await websocket.send_json({"type": "error", "message": "上游请求失败"})
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+            return
+
+        create_body = _safe_json(create_resp.content)
+        if not (200 <= create_resp.status_code < 300):
+            charge_and_record(
+                db,
+                user=user,
+                endpoint="video.generate_ws",
+                tokens=Decimal("0"),
+                amount_rmb=Decimal("0"),
+                status_text="failed",
+                request_id=request_id,
+                upstream_status_code=create_resp.status_code,
+                error_message=str(create_body)[:2000] if create_body is not None else create_resp.text[:2000],
+            )
+            await websocket.send_json({"type": "error", "message": "任务创建失败", "detail": create_body})
+            await websocket.close()
+            return
+
+        task_id = None
+        if isinstance(create_body, dict) and isinstance(create_body.get("id"), str):
+            task_id = create_body.get("id")
+        
+        if not task_id:
+            await websocket.send_json({"type": "error", "message": "未获取到任务ID"})
+            await websocket.close()
+            return
+
+        # 记录任务
+        vt = db.query(VideoTask).filter(VideoTask.user_id == user.id, VideoTask.task_id == task_id).one_or_none()
+        if not vt:
+            vt = VideoTask(
+                user_id=user.id,
+                task_id=task_id,
+                public_model=public_model.strip(),
+                upstream_model=upstream_model,
+                has_video_input=bool(has_video_input),
+            )
+            db.add(vt)
+            db.commit()
+            db.refresh(vt)
+
+        await websocket.send_json({"type": "status", "status": "created", "task_id": task_id, "message": "任务创建成功，正在等待产出..."})
+
+        # 4. 轮询逻辑
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        last_status = None
+
+        while True:
+            try:
+                resp = await forward_json(
+                    method="GET",
+                    path=f"/api/v3/contents/generations/tasks/{task_id}",
+                    headers=upstream_headers,
+                    params={},
+                )
+            except Exception as e:
+                logger.exception("upstream request failed", extra={"request_id": request_id})
+                await websocket.send_json({"type": "status", "status": "upstream_error", "message": "查询上游失败，重试中..."})
+                await asyncio.sleep(poll_interval_seconds)
+                continue
+
+            body = _safe_json(resp.content)
+            if 200 <= resp.status_code < 300 and isinstance(body, dict):
+                status_value = body.get("status")
+                if isinstance(status_value, str):
+                    st = status_value.lower()
+                    if st != last_status:
+                        last_status = st
+                        await websocket.send_json({"type": "status", "status": st, "message": f"任务状态更新: {st}"})
+
+                    if st == "succeeded":
+                        # 扣费逻辑
+                        content = body.get("content")
+                        usage = body.get("usage")
+                        video_url = None
+                        if isinstance(content, dict) and isinstance(content.get("video_url"), str):
+                            video_url = content.get("video_url")
+                        total_tokens = None
+                        if isinstance(usage, dict) and isinstance(usage.get("total_tokens"), int):
+                            total_tokens = usage.get("total_tokens")
+
+                        if bool(video_url) and isinstance(total_tokens, int) and total_tokens > 0:
+                            if not vt.charged:
+                                tokens_dec = Decimal(str(int(total_tokens)))
+                                hv = bool(vt.has_video_input)
+                                amount = quote_rmb(total_tokens=int(total_tokens), has_video_input=hv)
+                                ensure_balance(db, user, Decimal(str(amount)))
+                                charge_and_record(
+                                    db,
+                                    user=user,
+                                    endpoint="video.charge",
+                                    tokens=tokens_dec,
+                                    amount_rmb=Decimal(str(amount)),
+                                    status_text="success",
+                                    request_id=request_id,
+                                    upstream_status_code=resp.status_code,
+                                    task_id=task_id,
+                                )
+                                vt.charged = True
+                                vt.charged_tokens = int(total_tokens)
+                                vt.charged_amount_rmb = float(amount)
+                                vt.charged_at = datetime.utcnow()
+                                db.add(vt)
+                                db.commit()
+
+                        charge_and_record(
+                            db,
+                            user=user,
+                            endpoint="video.generate_ws",
+                            tokens=Decimal("0"),
+                            amount_rmb=Decimal("0"),
+                            status_text="success",
+                            request_id=request_id,
+                            upstream_status_code=resp.status_code,
+                            task_id=task_id,
+                        )
+                        await websocket.send_json({"type": "result", "data": body})
+                        await websocket.close()
+                        return
+
+                    if st in {"failed", "cancelled", "expired"}:
+                        charge_and_record(
+                            db,
+                            user=user,
+                            endpoint="video.generate_ws",
+                            tokens=Decimal("0"),
+                            amount_rmb=Decimal("0"),
+                            status_text=st,
+                            request_id=request_id,
+                            upstream_status_code=resp.status_code,
+                            task_id=task_id,
+                            error_message=str(body)[:2000],
+                        )
+                        await websocket.send_json({"type": "error", "message": f"任务执行终止: {st}", "detail": body})
+                        await websocket.close()
+                        return
+
+            if loop.time() >= deadline:
+                charge_and_record(
+                    db,
+                    user=user,
+                    endpoint="video.generate_ws",
+                    tokens=Decimal("0"),
+                    amount_rmb=Decimal("0"),
+                    status_text="timeout",
+                    request_id=request_id,
+                    upstream_status_code=resp.status_code if 'resp' in locals() else None,
+                    task_id=task_id,
+                )
+                await websocket.send_json({"type": "error", "message": "等待任务结果超时"})
+                await websocket.close()
+                return
+
+            await asyncio.sleep(poll_interval_seconds)
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected", extra={"request_id": request_id})
+    except Exception as e:
+        logger.exception("WebSocket error", extra={"request_id": request_id})
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+            await websocket.close()
+        except:
+            pass
+
+@app.post("/v1/video/tasks:generate")
+async def generate_video_task(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    request_id = _get_request_id(request)
+    raw_body = getattr(request.state, "raw_body", None)
+    payload = _safe_json(raw_body) if isinstance(raw_body, (bytes, bytearray)) else await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请求体必须是JSON对象")
+
+    poll_interval_seconds = payload.pop("poll_interval_seconds", 2)
+    timeout_seconds = payload.pop("timeout_seconds", 300)
+    try:
+        poll_interval_seconds = float(poll_interval_seconds)
+    except Exception:
+        poll_interval_seconds = 2
+    try:
+        timeout_seconds = float(timeout_seconds)
+    except Exception:
+        timeout_seconds = 300
+    poll_interval_seconds = max(0.2, min(poll_interval_seconds, 10.0))
+    timeout_seconds = max(1.0, min(timeout_seconds, 1800.0))
+
+    public_model = payload.get("model")
+    if not isinstance(public_model, str) or not public_model.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="缺少model参数")
+
+    payload = dict(payload)
+    public_api_key = payload.pop("api_key", None)
+    upstream_model = _resolve_upstream_model(db, public_model.strip())
+    payload["model"] = upstream_model
+    bearer = _resolve_upstream_bearer(db, public_api_key if isinstance(public_api_key, str) else None)
+    upstream_headers = _build_upstream_headers(bearer)
+    has_video_input = detect_video_input(payload)
+
+    try:
+        create_resp = await forward_json(
+            method="POST",
+            path="/api/v3/contents/generations/tasks",
+            headers=upstream_headers,
+            json_body=payload,
+        )
+    except Exception as e:
+        logger.exception("upstream request failed", extra={"request_id": request_id})
+        charge_and_record(
+            db,
+            user=user,
+            endpoint="video.generate",
+            tokens=Decimal("0"),
+            amount_rmb=Decimal("0"),
+            status_text="upstream_error",
+            request_id=request_id,
+            upstream_status_code=None,
+            error_message=str(e),
+        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="上游请求失败")
+
+    create_body = _safe_json(create_resp.content)
+    if not (200 <= create_resp.status_code < 300):
+        charge_and_record(
+            db,
+            user=user,
+            endpoint="video.generate",
+            tokens=Decimal("0"),
+            amount_rmb=Decimal("0"),
+            status_text="failed",
+            request_id=request_id,
+            upstream_status_code=create_resp.status_code,
+            error_message=str(create_body)[:2000] if create_body is not None else create_resp.text[:2000],
+        )
+        return Response(
+            content=create_resp.content,
+            status_code=create_resp.status_code,
+            media_type=create_resp.headers.get("content-type"),
+        )
+
+    task_id = None
+    if isinstance(create_body, dict) and isinstance(create_body.get("id"), str):
+        task_id = create_body.get("id")
+    if not task_id:
+        charge_and_record(
+            db,
+            user=user,
+            endpoint="video.generate",
+            tokens=Decimal("0"),
+            amount_rmb=Decimal("0"),
+            status_text="success",
+            request_id=request_id,
+            upstream_status_code=create_resp.status_code,
+        )
+        return Response(
+            content=create_resp.content,
+            status_code=create_resp.status_code,
+            media_type=create_resp.headers.get("content-type"),
+        )
+
+    vt = db.query(VideoTask).filter(VideoTask.user_id == user.id, VideoTask.task_id == task_id).one_or_none()
+    if not vt:
+        vt = VideoTask(
+            user_id=user.id,
+            task_id=task_id,
+            public_model=public_model.strip(),
+            upstream_model=upstream_model,
+            has_video_input=bool(has_video_input),
+        )
+        db.add(vt)
+        db.commit()
+        db.refresh(vt)
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    last_resp_content: bytes = b""
+    last_status_code: int = 0
+
+    while True:
+        try:
+            resp = await forward_json(
+                method="GET",
+                path=f"/api/v3/contents/generations/tasks/{task_id}",
+                headers=upstream_headers,
+                params={},
+            )
+        except Exception as e:
+            logger.exception("upstream request failed", extra={"request_id": request_id})
+            charge_and_record(
+                db,
+                user=user,
+                endpoint="video.generate",
+                tokens=Decimal("0"),
+                amount_rmb=Decimal("0"),
+                status_text="upstream_error",
+                request_id=request_id,
+                upstream_status_code=None,
+                task_id=task_id,
+                error_message=str(e),
+            )
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="上游请求失败")
+
+        last_resp_content = resp.content
+        last_status_code = resp.status_code
+        body = _safe_json(resp.content)
+
+        if 200 <= resp.status_code < 300 and isinstance(body, dict):
+            status_value = body.get("status")
+            if isinstance(status_value, str):
+                st = status_value.lower()
+                if st == "succeeded":
+                    content = body.get("content")
+                    usage = body.get("usage")
+                    video_url = None
+                    if isinstance(content, dict) and isinstance(content.get("video_url"), str):
+                        video_url = content.get("video_url")
+                    total_tokens = None
+                    if isinstance(usage, dict) and isinstance(usage.get("total_tokens"), int):
+                        total_tokens = usage.get("total_tokens")
+
+                    if bool(video_url) and isinstance(total_tokens, int) and total_tokens > 0:
+                        if not vt.charged:
+                            tokens_dec = Decimal(str(int(total_tokens)))
+                            hv = bool(vt.has_video_input)
+                            amount = quote_rmb(total_tokens=int(total_tokens), has_video_input=hv)
+                            ensure_balance(db, user, Decimal(str(amount)))
+                            charge_and_record(
+                                db,
+                                user=user,
+                                endpoint="video.charge",
+                                tokens=tokens_dec,
+                                amount_rmb=Decimal(str(amount)),
+                                status_text="success",
+                                request_id=request_id,
+                                upstream_status_code=resp.status_code,
+                                task_id=task_id,
+                            )
+                            vt.charged = True
+                            vt.charged_tokens = int(total_tokens)
+                            vt.charged_amount_rmb = float(amount)
+                            vt.charged_at = datetime.utcnow()
+                            db.add(vt)
+                            db.commit()
+
+                        charge_and_record(
+                            db,
+                            user=user,
+                            endpoint="video.generate",
+                            tokens=Decimal("0"),
+                            amount_rmb=Decimal("0"),
+                            status_text="success",
+                            request_id=request_id,
+                            upstream_status_code=resp.status_code,
+                            task_id=task_id,
+                        )
+                        return Response(
+                            content=resp.content,
+                            status_code=resp.status_code,
+                            media_type=resp.headers.get("content-type"),
+                        )
+
+                if st in {"failed", "cancelled", "expired"}:
+                    charge_and_record(
+                        db,
+                        user=user,
+                        endpoint="video.generate",
+                        tokens=Decimal("0"),
+                        amount_rmb=Decimal("0"),
+                        status_text=st,
+                        request_id=request_id,
+                        upstream_status_code=resp.status_code,
+                        task_id=task_id,
+                        error_message=str(body)[:2000],
+                    )
+                    return Response(
+                        content=resp.content,
+                        status_code=resp.status_code,
+                        media_type=resp.headers.get("content-type"),
+                    )
+
+        if loop.time() >= deadline:
+            charge_and_record(
+                db,
+                user=user,
+                endpoint="video.generate",
+                tokens=Decimal("0"),
+                amount_rmb=Decimal("0"),
+                status_text="timeout",
+                request_id=request_id,
+                upstream_status_code=last_status_code or None,
+                task_id=task_id,
+                error_message=(str(_safe_json(last_resp_content))[:2000] if last_resp_content else None),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail={"message": "等待视频任务结果超时", "task_id": task_id},
+            )
+
+        await asyncio.sleep(poll_interval_seconds)
 
 
 @app.get("/v1/video/tasks/{task_id}")
@@ -370,6 +885,7 @@ async def get_video_task(
             user=user,
             endpoint="video.get",
             tokens=Decimal("0"),
+            amount_rmb=Decimal("0"),
             status_text="upstream_error",
             request_id=request_id,
             upstream_status_code=None,
@@ -415,12 +931,15 @@ async def get_video_task(
 
             if not vt.charged:
                 tokens_dec = Decimal(str(int(total_tokens)))
-                ensure_balance(db, user, tokens_dec)
+                hv = bool(vt.has_video_input)
+                amount_rmb = quote_rmb(total_tokens=int(total_tokens), has_video_input=hv)
+                ensure_balance(db, user, Decimal(str(amount_rmb)))
                 charge_and_record(
                     db,
                     user=user,
                     endpoint="video.charge",
                     tokens=tokens_dec,
+                    amount_rmb=Decimal(str(amount_rmb)),
                     status_text="success",
                     request_id=request_id,
                     upstream_status_code=resp.status_code,
@@ -428,6 +947,7 @@ async def get_video_task(
                 )
                 vt.charged = True
                 vt.charged_tokens = int(total_tokens)
+                vt.charged_amount_rmb = float(amount_rmb)
                 vt.charged_at = datetime.utcnow()
                 db.add(vt)
                 db.commit()
@@ -438,6 +958,7 @@ async def get_video_task(
         user=user,
         endpoint="video.get",
         tokens=Decimal("0"),
+        amount_rmb=Decimal("0"),
         status_text="success" if 200 <= resp.status_code < 300 else "failed",
         request_id=request_id,
         upstream_status_code=resp.status_code,
@@ -494,6 +1015,7 @@ async def _cancel_impl(
             user=user,
             endpoint="video.cancel",
             tokens=Decimal("0"),
+            amount_rmb=Decimal("0"),
             status_text="upstream_error",
             request_id=request_id,
             upstream_status_code=None,
@@ -518,6 +1040,7 @@ async def _cancel_impl(
             user=user,
             endpoint="video.cancel",
             tokens=Decimal("0"),
+            amount_rmb=Decimal("0"),
             status_text="success",
             request_id=request_id,
             upstream_status_code=resp.status_code,
@@ -529,6 +1052,7 @@ async def _cancel_impl(
             user=user,
             endpoint="video.cancel",
             tokens=Decimal("0"),
+            amount_rmb=Decimal("0"),
             status_text="failed",
             request_id=request_id,
             upstream_status_code=resp.status_code,
@@ -577,7 +1101,7 @@ def list_usage_records(
     for r in q.all():
         has_video_input = None
         rmb_per_million = None
-        amount_rmb = None
+        amount_rmb = float(r.amount_rmb) if r.amount_rmb is not None else 0.0
         if r.task_id:
             vt = (
                 db.query(VideoTask)
@@ -594,7 +1118,10 @@ def list_usage_records(
                 if hv
                 else cfg.pricing.money.without_video_input_rmb_per_million
             )
-            amount_rmb = float(quote_rmb(total_tokens=int(float(r.tokens_charged)), has_video_input=hv))
+            if not amount_rmb:
+                amount_rmb = float(
+                    quote_rmb(total_tokens=int(float(r.tokens_charged)), has_video_input=hv)
+                )
 
         items.append(
             {

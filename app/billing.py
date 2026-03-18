@@ -10,22 +10,6 @@ from app.config import get_config
 from app.models import ConsumptionRecord, User
 
 
-def estimate_create_tokens(payload: dict[str, Any]) -> int:
-    cfg = get_config()
-    duration = payload.get("duration")
-    if isinstance(duration, (int, float)) and duration > 0:
-        duration_seconds = float(duration)
-    else:
-        duration_seconds = float(cfg.pricing.create.default_duration_seconds)
-
-    resolution = payload.get("resolution")
-    multiplier = 1.0
-    if isinstance(resolution, str):
-        multiplier = cfg.pricing.create.resolution_multiplier.get(resolution, 1.0)
-
-    return int(duration_seconds * cfg.pricing.create.tokens_per_second * multiplier)
-
-
 def detect_video_input(payload: dict[str, Any]) -> bool:
     content = payload.get("content")
     if not isinstance(content, list):
@@ -61,9 +45,9 @@ def _as_decimal(value: Any) -> Decimal:
         return Decimal("0")
 
 
-def ensure_balance(db: Session, user: User, required_tokens: Decimal):
+def ensure_balance(db: Session, user: User, required_rmb: Decimal):
     db.refresh(user)
-    if _as_decimal(user.balance_tokens) < required_tokens:
+    if _as_decimal(user.balance_rmb) < required_rmb:
         raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="余额不足")
 
 
@@ -73,6 +57,7 @@ def charge_and_record(
     user: User,
     endpoint: str,
     tokens: Decimal,
+    amount_rmb: Decimal,
     status_text: str,
     request_id: Optional[str],
     upstream_status_code: Optional[int],
@@ -80,15 +65,18 @@ def charge_and_record(
     error_message: Optional[str] = None,
 ):
     db.refresh(user)
-    balance_before = _as_decimal(user.balance_tokens)
+    balance_before = _as_decimal(user.balance_rmb)
     if tokens < 0:
         tokens = Decimal("0")
 
-    if tokens > 0 and balance_before < tokens:
+    if amount_rmb < 0:
+        amount_rmb = Decimal("0")
+
+    if amount_rmb > 0 and balance_before < amount_rmb:
         raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="余额不足")
 
-    balance_after = balance_before - tokens
-    user.balance_tokens = balance_after
+    balance_after = balance_before - amount_rmb
+    user.balance_rmb = balance_after
 
     record = ConsumptionRecord(
         user_id=user.id,
@@ -96,6 +84,7 @@ def charge_and_record(
         task_id=task_id,
         request_id=request_id,
         tokens_charged=tokens,
+        amount_rmb=amount_rmb,
         balance_before=balance_before,
         balance_after=balance_after,
         status=status_text,
